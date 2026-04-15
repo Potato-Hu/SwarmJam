@@ -44,7 +44,7 @@ baseline_assumptions:
 
 training:
   # Total number of policy updates.
-  num_updates: 200
+  num_updates: 2000
 
   # Batch size counts flattened agent-time samples used in one PPO update.
   # In the current single-environment implementation:
@@ -71,13 +71,13 @@ training:
   gae_lambda: 0.95
 
   # PPO clipping ratio. Smaller values make the policy update more conservative.
-  clip_ratio: 0.08
+  clip_ratio: 0.2  # 旧的 0.08
 
   # Coefficient of the critic value loss.
   value_loss_coef: 0.5
 
   # Coefficient of the entropy bonus.
-  entropy_coef: 0.03
+  entropy_coef: 0.01 # 旧的 0.03
 
   # Whether to normalize value targets with running mean/std.
   # The critic predicts normalized values and MAPPO denormalizes them for rollout/GAE.
