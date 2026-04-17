@@ -66,8 +66,8 @@ def _random_positions(count: int, bounds: np.ndarray, rng: np.random.Generator) 
 
 
 def _nearby_distance_limits(bounds: np.ndarray) -> tuple[float, float]:
-    min_distance = float(bounds[0] / 20.0)
-    max_distance = float(bounds[0] / 5.0)
+    min_distance = float(bounds[0] / 40.0)
+    max_distance = float(bounds[0] / 10.0)
     if max_distance <= 0.0:
         raise ValueError("x boundary must be positive to sample nearby initial positions.")
     return min_distance, max_distance
@@ -135,8 +135,26 @@ def _sample_near_anchors(
     *,
     entity_name: str,
 ) -> np.ndarray:
+    positions, _ = _sample_near_anchors_with_indices(
+        anchors,
+        count,
+        bounds,
+        rng,
+        entity_name=entity_name,
+    )
+    return positions
+
+
+def _sample_near_anchors_with_indices(
+    anchors: np.ndarray,
+    count: int,
+    bounds: np.ndarray,
+    rng: np.random.Generator,
+    *,
+    entity_name: str,
+) -> tuple[np.ndarray, np.ndarray]:
     if count == 0:
-        return np.zeros((0, 3), dtype=float)
+        return np.zeros((0, 3), dtype=float), np.zeros(0, dtype=int)
 
     min_distance, max_distance = _nearby_distance_limits(bounds)
     anchor_indices = _anchor_indices_for_nearby_positions(
@@ -155,7 +173,16 @@ def _sample_near_anchors(
         )
         for anchor_idx in anchor_indices
     ]
-    return np.asarray(nearby_positions, dtype=float)
+    return np.asarray(nearby_positions, dtype=float), anchor_indices
+
+
+def _nearest_anchor_indices(positions: np.ndarray, anchors: np.ndarray) -> np.ndarray:
+    if positions.shape[0] == 0:
+        return np.zeros(0, dtype=int)
+    if anchors.shape[0] == 0:
+        raise ValueError("Cannot assign nonkey_enemy anchors because key_num is 0.")
+    distances = np.linalg.norm(positions[:, None, :] - anchors[None, :, :], axis=-1)
+    return np.argmin(distances, axis=1).astype(int)
 
 
 def _format_coord(coord: Sequence[float]) -> str:
@@ -227,17 +254,17 @@ def assign_initial_positions(
         if manual_positions.get("key_enemy") is not None
         else _random_positions(key_num, scene_bounds, position_rng)
     )
-    nonkey_positions = (
-        _validate_positions("nonkey_enemy", manual_positions["nonkey_enemy"], nonkey_num, scene_bounds)
-        if manual_positions.get("nonkey_enemy") is not None
-        else _sample_near_anchors(
+    if manual_positions.get("nonkey_enemy") is not None:
+        nonkey_positions = _validate_positions("nonkey_enemy", manual_positions["nonkey_enemy"], nonkey_num, scene_bounds)
+        nonkey_anchor_indices = _nearest_anchor_indices(nonkey_positions, key_positions)
+    else:
+        nonkey_positions, nonkey_anchor_indices = _sample_near_anchors_with_indices(
             key_positions,
             nonkey_num,
             scene_bounds,
             position_rng,
             entity_name="nonkey_enemy",
         )
-    )
     friendly_positions = (
         _validate_positions("friend_drone", manual_positions["friend_drone"], mydrone_num, scene_bounds)
         if manual_positions.get("friend_drone") is not None
@@ -256,6 +283,7 @@ def assign_initial_positions(
     return {
         "key_enemy": np.asarray(key_positions, dtype=float),
         "nonkey_enemy": np.asarray(nonkey_positions, dtype=float),
+        "nonkey_anchor_indices": np.asarray(nonkey_anchor_indices, dtype=int),
         "enemy": enemy_positions,
         "key_indices": key_indices,
         "friend_drone": np.asarray(friendly_positions, dtype=float),
@@ -277,6 +305,14 @@ def initialize_scene(
     base_seed = get_default_seed() if seed is None else int(seed)
     resolved_enemy_vmax = get_enemy_vmax() if enemy_vmax is None else float(enemy_vmax)
     resolved_friendly_vmax = get_friendly_vmax() if friendly_vmax is None else float(friendly_vmax)
+    mobility_config = get_enemy_mobility_config()
+    companion_config = mobility_config.get("non_key_companion", {})
+    if not isinstance(companion_config, dict):
+        companion_config = {}
+    use_nonkey_companion = bool(companion_config.get("enabled", False))
+    companion_direction_jitter_std = float(companion_config.get("direction_jitter_std", 0.15))
+    companion_pitch_jitter_std = float(companion_config.get("pitch_jitter_std", 0.03))
+    companion_rng = np.random.default_rng(base_seed + 10_000)
     positions = assign_initial_positions(
         key_num=key_num,
         nonkey_num=nonkey_num,
@@ -288,8 +324,24 @@ def initialize_scene(
 
     enemy_nodes: list[EnemyNode] = []
     key_indices = set(np.asarray(positions["key_indices"], dtype=int).tolist())
+    nonkey_anchor_indices = np.asarray(positions["nonkey_anchor_indices"], dtype=int)
+    key_directions = {
+        key_idx: 0.0 if key_idx % 2 == 0 else np.pi
+        for key_idx in key_indices
+    }
+    key_pitches = {key_idx: 0.04 for key_idx in key_indices}
     for node_id, coords in enumerate(positions["enemy"]):
         role = "key" if node_id in key_indices else "non_key"
+        if role == "key":
+            direction = key_directions[node_id]
+            pitch = key_pitches[node_id]
+        elif use_nonkey_companion and key_num > 0:
+            anchor_idx = int(nonkey_anchor_indices[node_id - key_num])
+            direction = key_directions[anchor_idx] + float(companion_rng.normal(0.0, companion_direction_jitter_std))
+            pitch = key_pitches[anchor_idx] + float(companion_rng.normal(0.0, companion_pitch_jitter_std))
+        else:
+            direction = 0.0 if node_id % 2 == 0 else np.pi
+            pitch = -0.04
         enemy_nodes.append(
             EnemyNode(
                 node_id=node_id,
@@ -297,8 +349,8 @@ def initialize_scene(
                 position=coords,
                 speed=resolved_enemy_vmax,
                 seed=base_seed + node_id,
-                direction=0.0 if node_id % 2 == 0 else np.pi,
-                pitch=0.04 if role == "key" else -0.04,
+                direction=direction,
+                pitch=pitch,
             )
         )
 

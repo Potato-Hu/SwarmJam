@@ -21,8 +21,20 @@ from src.env.spaces import (
 )
 from src.env.world import SwarmWorld
 from src.rl.reward import compute_difference_rewards, compute_distance_assignment, compute_power_progress_rewards
+from src.sensing.global_sensor import DelayedNoisyKeyTargetSensor, GlobalKeyTargetSensingConfig
+from src.sensing.local_sensor import LocalSensingConfig, LocalTargetObservation, LocalTargetSensor
+from src.sensing.observation_builder import build_policy_enemy_view
 from src.simulation.ground_truth import PositionDict, ScenarioGroundTruth, initialize_scene
-from src.utils.config_loader import get_num_steps, get_reward_config
+from src.utils.config_loader import (
+    get_global_sensing_config,
+    get_local_sensing_config,
+    get_num_steps,
+    get_policy_input_mode,
+    get_reward_config,
+)
+
+
+POLICY_INPUT_MODES = {"observation", "groundtruth"}
 
 
 @dataclass
@@ -37,10 +49,9 @@ class EnvStepOutput:
 class SwarmEnv:
     """Lightweight env skeleton built on top of SwarmWorld.
 
-    Current observation/state design is a TEST-ONLY SIMPLE BASELINE used to get MAPPO
-    training wired up before the final sensing + association stack is integrated.
-    In particular, per-agent observations are still ground-truth placeholders rather than
-    noisy global observations corrected by local sensing.
+    Current observation/state design is a compact MAPPO baseline. Policy inputs can use
+    either the observation branch or the earlier ground-truth prototype, while world truth
+    remains internal for dynamics, rewards, interference, and evaluation logs.
     """
 
     def __init__(
@@ -62,6 +73,7 @@ class SwarmEnv:
         progress_weight: float | None = None,
         progress_distance_scale: float | None = None,
         move_penalty_weight: float | None = None,
+        policy_input_mode: str | None = None,
     ) -> None:
         self.key_num = int(key_num)
         self.nonkey_num = int(nonkey_num)
@@ -73,6 +85,13 @@ class SwarmEnv:
         self.enemy_vmax = enemy_vmax
         self.friendly_vmax = friendly_vmax
         self.initial_positions = initial_positions
+        resolved_policy_input_mode = get_policy_input_mode() if policy_input_mode is None else policy_input_mode
+        self.policy_input_mode = str(resolved_policy_input_mode).lower()
+        if self.policy_input_mode not in POLICY_INPUT_MODES:
+            raise ValueError(
+                "policy_input.mode must be either 'observation' or 'groundtruth', "
+                f"got {self.policy_input_mode!r}."
+            )
 
         # Reward hyperparameters for the shared team reward used by all friendly UAVs.
         reward_config = get_reward_config()
@@ -97,6 +116,19 @@ class SwarmEnv:
             if move_penalty_weight is None
             else move_penalty_weight
         )
+        sensing_config = get_global_sensing_config()
+        global_sensor_config = GlobalKeyTargetSensingConfig(
+            radar_delay_seconds=float(sensing_config["radar_delay_seconds"]),
+            position_noise_std_m=float(sensing_config["key_enemy_position_noise_std_m"]),
+        )
+        self.global_key_target_sensor = DelayedNoisyKeyTargetSensor(global_sensor_config, seed=self.seed)
+        local_sensing_config = get_local_sensing_config()
+        local_sensor_config = LocalSensingConfig(
+            detection_radius_m=float(local_sensing_config["detection_radius_m"]),
+            max_candidates=int(local_sensing_config["max_candidates"]),
+            position_noise_std_m=float(local_sensing_config["local_position_noise_std_m"]),
+        )
+        self.local_target_sensor = LocalTargetSensor(local_sensor_config, seed=self.seed)
 
         self.agent_ids = build_agent_ids(self.mydrone_num)
         self.scene: ScenarioGroundTruth | None = None
@@ -134,6 +166,8 @@ class SwarmEnv:
         )
         self.world = SwarmWorld.from_scene(self.scene)
         self.world.reset()
+        self.global_key_target_sensor.reset(self.world.get_key_enemy_positions(), seed=self.seed)
+        self.local_target_sensor.reset(seed=self.seed)
         self._build_spaces()
         self._reset_tracking_memory()
 
@@ -146,6 +180,7 @@ class SwarmEnv:
                 "friendly_interference_watts": float(self.world.interference.friendly_received_watts[idx]),
                 "key_enemy_interference_dbm": self.world.interference.key_enemy_received_dbm.copy(),
                 "key_enemy_interference_watts": self.world.interference.key_enemy_received_watts.copy(),
+                "policy_input_mode": self.policy_input_mode,
             }
             for idx, agent_id in enumerate(self.agent_ids)
         }
@@ -159,6 +194,7 @@ class SwarmEnv:
 
         ordered_actions = np.asarray([int(actions[agent_id]) for agent_id in self.agent_ids], dtype=int)
         result = self.world.step(friendly_actions=ordered_actions, dt=self.dt)
+        self.global_key_target_sensor.record_truth(self.world.get_key_enemy_positions())
 
         observations = self._build_observations()
 
@@ -166,7 +202,7 @@ class SwarmEnv:
         # marginal contribution to received jamming power at key targets.
         # Non-key enemies remain in the scene as clutter, but they do not enter this simple
         # baseline reward directly.
-        key_enemy_positions = self._get_policy_key_target_positions()
+        key_enemy_positions = self.world.get_key_enemy_positions()
         pairwise_key_distances = self._pairwise_distances(result.friendly_positions, key_enemy_positions)
         if self.reward_mode == "sustained_tracking":
             assignment_components = compute_distance_assignment(pairwise_distances=pairwise_key_distances)
@@ -226,6 +262,7 @@ class SwarmEnv:
                 "friendly_interference_watts": float(result.friendly_interference_watts[idx]),
                 "key_enemy_interference_dbm": result.key_enemy_interference_dbm.copy(),
                 "key_enemy_interference_watts": result.key_enemy_interference_watts.copy(),
+                "policy_input_mode": self.policy_input_mode,
                 "reward_mode": self.reward_mode,
                 "difference_reward": float(difference_rewards[idx]),
                 "tracking_reward": float(tracking_rewards[idx]),
@@ -281,24 +318,40 @@ class SwarmEnv:
         }
 
     def _get_policy_key_target_positions(self) -> np.ndarray:
-        """Return key-target positions used by actor observations and rewards.
-
-        This truth-state baseline deliberately returns ground-truth key positions.  The
-        association pipeline can later replace this single hook with denoised key-target
-        estimates while keeping the MAPPO/reward interface stable.
-        """
+        """Return key-target positions from the selected policy-input branch."""
 
         if self.world is None:
             raise RuntimeError("reset() must be called before reading key targets.")
-        return self.world.get_key_enemy_positions()
+        if self.policy_input_mode == "groundtruth":
+            return self.world.get_key_enemy_positions()
+
+        return self.global_key_target_sensor.observe(
+            time_step=self.world.time_step,
+            dt=self.dt,
+            fallback_key_positions=self.world.get_key_enemy_positions(),
+        )
+
+    def _include_non_key_policy_inputs(self) -> bool:
+        return self.policy_input_mode == "groundtruth"
+
+    def _get_policy_enemy_view(self) -> tuple[np.ndarray, np.ndarray]:
+        if self.world is None:
+            raise RuntimeError("reset() must be called before reading enemy positions.")
+        return build_policy_enemy_view(
+            enemy_positions=self.world.get_enemy_positions(),
+            enemy_roles=[node.role for node in self.world.enemy_nodes],
+            key_target_positions=self._get_policy_key_target_positions(),
+            include_non_key=self._include_non_key_policy_inputs(),
+        )
 
     def get_global_state(self) -> np.ndarray:
-        """Return a flattened global ground-truth state including RF interference truth."""
+        """Return a flattened critic state using the selected policy-input enemy view."""
 
         if self.world is None:
             raise RuntimeError("reset() must be called before get_global_state().")
 
-        enemy_positions = self.world.get_enemy_positions().reshape(-1)
+        enemy_positions, _ = self._get_policy_enemy_view()
+        enemy_positions = enemy_positions.reshape(-1)
         friendly_positions = self.world.get_friendly_positions().reshape(-1)
         key_enemy_interference_dbm = self.world.interference.key_enemy_received_dbm.reshape(-1)
         friendly_interference_dbm = self.world.interference.friendly_received_dbm.reshape(-1)
@@ -307,12 +360,32 @@ class SwarmEnv:
             dtype=np.float32,
         )
 
+    def get_local_observations(self) -> dict[str, LocalTargetObservation]:
+        """Return fixed-length local target observations for each friendly UAV.
+
+        These observations are sensing outputs only. They are not currently fed to actor
+        observations or critic state.
+        """
+
+        if self.world is None:
+            raise RuntimeError("reset() must be called before get_local_observations().")
+
+        enemy_positions = self.world.get_enemy_positions()
+        friendly_positions = self.world.get_friendly_positions()
+        return {
+            agent_id: self.local_target_sensor.observe(
+                friendly_position=friendly_positions[idx],
+                target_positions=enemy_positions,
+            )
+            for idx, agent_id in enumerate(self.agent_ids)
+        }
+
     def _build_spaces(self) -> None:
         if self.world is None or not self.world.friendly_uavs:
             return
 
         action_dim = self.world.friendly_uavs[0].action_dim
-        num_enemies = len(self.world.enemy_nodes)
+        num_enemies = len(self.world.enemy_nodes) if self._include_non_key_policy_inputs() else len(self.world.get_key_enemy_nodes())
         num_friendlies = len(self.world.friendly_uavs)
         num_key_enemies = len(self.world.get_key_enemy_nodes())
         self.space_spec = build_space_spec(num_friendlies, num_enemies, num_key_enemies, action_dim)
@@ -329,11 +402,9 @@ class SwarmEnv:
         if self.world is None:
             raise RuntimeError("reset() must be called before building observations.")
 
-        # TEST-ONLY SIMPLE BASELINE:
-        # Actor observations expose normalized relative geometry so the policy does not
-        # need to infer target directions by subtracting raw absolute coordinates.
-        enemy_positions = self.world.get_enemy_positions()
-        enemy_is_key = np.asarray([1.0 if node.role == "key" else 0.0 for node in self.world.enemy_nodes], dtype=float)
+        # Actor observations expose normalized relative geometry based on the selected
+        # policy-visible enemy view.
+        enemy_positions, enemy_is_key = self._get_policy_enemy_view()
         key_enemy_positions = self._get_policy_key_target_positions()
         friendly_positions = self.world.get_friendly_positions()
         bounds = np.asarray(self.world.bounds, dtype=float)

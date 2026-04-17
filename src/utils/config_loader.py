@@ -87,6 +87,45 @@ def get_num_steps(path: str | Path | None = None) -> int:
     return int(get_simulation_config(path).get("num_steps", 10))
 
 
+def get_policy_input_mode(path: str | Path | None = None) -> str:
+    """Read whether policy inputs use observations or ground truth."""
+
+    env_config = get_env_config(path)
+    policy_input_config = env_config.get("policy_input", {})
+    if not isinstance(policy_input_config, dict):
+        policy_input_config = {}
+    return str(policy_input_config.get("mode", "observation")).lower()
+
+
+def get_global_sensing_config(path: str | Path | None = None) -> dict[str, float]:
+    """Read external global-sensing settings from env config."""
+
+    env_config = get_env_config(path)
+    sensing_config = env_config.get("global_sensing", {})
+    if not isinstance(sensing_config, dict):
+        sensing_config = {}
+
+    return {
+        "radar_delay_seconds": float(sensing_config.get("radar_delay_seconds", 1.0)),
+        "key_enemy_position_noise_std_m": float(sensing_config.get("key_enemy_position_noise_std_m", 2.0)),
+    }
+
+
+def get_local_sensing_config(path: str | Path | None = None) -> dict[str, float | int]:
+    """Read local target-sensing settings from env config."""
+
+    env_config = get_env_config(path)
+    sensing_config = env_config.get("local_sensing", {})
+    if not isinstance(sensing_config, dict):
+        sensing_config = {}
+
+    return {
+        "detection_radius_m": float(sensing_config.get("detection_radius_m", 50.0)),
+        "max_candidates": int(sensing_config.get("max_candidates", 5)),
+        "local_position_noise_std_m": float(sensing_config.get("local_position_noise_std_m", 1.0)),
+    }
+
+
 def should_print_initial_positions(path: str | Path | None = None) -> bool:
     return bool(get_simulation_config(path).get("print_initial_positions", True))
 

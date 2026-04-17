@@ -1,8 +1,8 @@
 """Space builders for the swarm RL project.
 
 This file defines action, observation, and global-state spaces used by the env skeleton.
-Current observation design is a simple ground-truth placeholder so training can be wired up
-before the sensing module is integrated.
+Current observation design keeps a compact geometry layout over the policy-visible enemy
+view. Observation mode exposes key targets only; groundtruth mode keeps the full enemy list.
 """
 
 from __future__ import annotations

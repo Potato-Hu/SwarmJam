@@ -1,10 +1,9 @@
 """Training entry for the TEST-ONLY simple MAPPO baseline.
 
 This path intentionally keeps the temporary engineering shortcuts:
-- no sensing
-- no association
-- actor observations are direct ground-truth placeholders
-- critic state is the full ground-truth global state
+- no local sensing or association
+- key-target policy inputs are selected by config/env.yaml policy_input.mode
+- rewards and evaluation logs still use world truth
 
 The goal is only to prove the simplified cooperative MAPPO chain can train end-to-end.
 """
@@ -71,6 +70,7 @@ def initialize_simple_baseline_env(config_path: str | Path | None = None) -> tup
         "observation_dim": env.space_spec.per_agent_obs_dim,
         "global_state_dim": env.space_spec.global_state_dim,
         "action_dim": env.space_spec.per_agent_action_dim,
+        "policy_input_mode": env.policy_input_mode,
         "dt": env.dt,
         "max_steps": env.max_steps,
         "initial_observation_shapes": {agent_id: obs.shape for agent_id, obs in observations.items()},

@@ -4,8 +4,8 @@
 # Simplified assumptions in this baseline:
 # - 3 friendly UAVs vs 3 key enemy UAVs and 3 non-key enemy UAVs
 # - no key-target association
-# - actor uses full ground-truth observations
-# - critic uses full global ground-truth state
+# - actor and critic target inputs are selected by config/env.yaml policy_input.mode
+# - rewards, interference, and evaluation logs still use world truth
 # These settings are NOT the final project setup and should later be replaced by
 # association + noisy global observation + local observation correction.
 
@@ -15,7 +15,7 @@ scenario:
 
   # Number of non-key enemy UAVs kept in the scene as clutter.
   # They are generated with the same scene initialization rules as ground_truth.py.
-  nonkey_enemy_count: 3
+  nonkey_enemy_count: 6
 
   # Number of friendly UAV agents controlled by MAPPO.
   friendly_uav_count: 3
@@ -32,11 +32,8 @@ baseline_assumptions:
   # No key-target association module is used in this baseline.
   no_association: true
 
-  # Actor directly receives ground-truth observations instead of noisy observations.
-  use_ground_truth_actor_obs: true
-
-  # Critic directly receives the full global ground-truth state.
-  use_ground_truth_critic_state: true
+  # Actor/critic policy input mode is controlled by config/env.yaml policy_input.mode.
+  # Valid modes are observation and groundtruth.
 
   # Key enemies are kept first in the enemy ordering because initialize_scene() creates
   # key nodes before non-key nodes. This ordering is a TEST-ONLY shortcut for the simple baseline.
