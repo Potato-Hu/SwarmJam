@@ -4,10 +4,10 @@
 # Simplified assumptions in this baseline:
 # - 3 friendly UAVs vs 3 key enemy UAVs and 3 non-key enemy UAVs
 # - no key-target association
-# - actor and critic target inputs are selected by config/env.yaml policy_input.mode
+# - actor and critic inputs follow config/env.yaml policy_input.mode
 # - rewards, interference, and evaluation logs still use world truth
 # These settings are NOT the final project setup and should later be replaced by
-# association + noisy global observation + local observation correction.
+# association + noisy global priors + local observation correction.
 
 scenario:
   # Number of key enemy UAVs that define the real jamming objective.
@@ -32,8 +32,7 @@ baseline_assumptions:
   # No key-target association module is used in this baseline.
   no_association: true
 
-  # Actor/critic policy input mode is controlled by config/env.yaml policy_input.mode.
-  # Valid modes are observation and groundtruth.
+  # Actor/critic inputs follow config/env.yaml policy_input.mode.
 
   # Key enemies are kept first in the enemy ordering because initialize_scene() creates
   # key nodes before non-key nodes. This ordering is a TEST-ONLY shortcut for the simple baseline.
@@ -47,19 +46,19 @@ training:
   # In the current single-environment implementation:
   #   batch_size = rollout_length * num_agents
   # If batch_size is set, rollout_length will be derived automatically from it.
-  batch_size: 192
+  batch_size: 384
 
   # Number of environment steps collected before each PPO update.
   # Kept here for readability and backward compatibility. If batch_size is set,
   # MAPPO will internally recompute rollout_length = batch_size / num_agents.
-  rollout_length: 64
+  rollout_length: 128
 
   # Number of PPO optimization epochs per update.
   ppo_epochs: 4
 
   # Number of samples per mini-batch during PPO updates.
   # minibatch_size is the chunk used inside one epoch, and should be <= batch_size.
-  minibatch_size: 32
+  minibatch_size: 64
 
   # Discount factor for future rewards.
   gamma: 0.99
@@ -115,12 +114,11 @@ marl:
   # Whether all agents share one actor policy.
   share_policy: true
 
-  # Whether the critic uses centralized global state information.
+  # Whether the critic uses a centralized local-only state.
   use_centralized_critic: true
 
-  # Future hook: allow the critic to concatenate global state with flattened local observations.
-  # Keep false for the current truth-state debug baseline. Later this can be turned on after
-  # noisy/global-local observation models are completed.
+  # Future hook: allow the critic to concatenate extra local/association features.
+  # Keep false for the current strict local-only baseline.
   use_critic_local_observations: false
 
 logging:

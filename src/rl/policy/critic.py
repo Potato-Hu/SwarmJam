@@ -9,10 +9,9 @@ from src.rl.policy.feature_encoder import FeatureEncoder
 class MAPPOCritic(nn.Module):
     """Centralized critic that estimates one state value per friendly agent.
 
-    The input can optionally concatenate global state and flattened local observations.
-    For the current debug baseline, `local_observations` is left unused and the critic
-    sees only the global truth state. This hook is kept so we can later plug in
-    association/sensing outputs without rewriting the critic backbone.
+    The state contract is selected by the environment policy-input mode. `local_only`
+    concatenates legal per-agent local observations; `groundtruth` uses full world-truth
+    critic features for debug training.
     """
 
     def __init__(

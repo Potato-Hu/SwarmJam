@@ -1,8 +1,8 @@
 """Training entry for the TEST-ONLY simple MAPPO baseline.
 
 This path intentionally keeps the temporary engineering shortcuts:
-- no local sensing or association
-- key-target policy inputs are selected by config/env.yaml policy_input.mode
+- no association module output is used by actor/critic
+- actor/critic inputs follow config/env.yaml policy_input.mode
 - rewards and evaluation logs still use world truth
 
 The goal is only to prove the simplified cooperative MAPPO chain can train end-to-end.

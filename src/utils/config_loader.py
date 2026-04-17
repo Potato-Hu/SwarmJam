@@ -88,13 +88,13 @@ def get_num_steps(path: str | Path | None = None) -> int:
 
 
 def get_policy_input_mode(path: str | Path | None = None) -> str:
-    """Read whether policy inputs use observations or ground truth."""
+    """Read the configured policy input mode."""
 
     env_config = get_env_config(path)
     policy_input_config = env_config.get("policy_input", {})
     if not isinstance(policy_input_config, dict):
         policy_input_config = {}
-    return str(policy_input_config.get("mode", "observation")).lower()
+    return str(policy_input_config.get("mode", "local_only")).lower()
 
 
 def get_global_sensing_config(path: str | Path | None = None) -> dict[str, float]:

@@ -21,6 +21,7 @@ from src.env.spaces import (
 )
 from src.env.world import SwarmWorld
 from src.rl.reward import compute_difference_rewards, compute_distance_assignment, compute_power_progress_rewards
+from src.sensing.association import AssociationOutput, empty_association_output
 from src.sensing.global_sensor import DelayedNoisyKeyTargetSensor, GlobalKeyTargetSensingConfig
 from src.sensing.local_sensor import LocalSensingConfig, LocalTargetObservation, LocalTargetSensor
 from src.sensing.observation_builder import build_policy_enemy_view
@@ -34,7 +35,7 @@ from src.utils.config_loader import (
 )
 
 
-POLICY_INPUT_MODES = {"observation", "groundtruth"}
+POLICY_INPUT_MODES = {"local_only", "groundtruth"}
 
 
 @dataclass
@@ -49,9 +50,9 @@ class EnvStepOutput:
 class SwarmEnv:
     """Lightweight env skeleton built on top of SwarmWorld.
 
-    Current observation/state design is a compact MAPPO baseline. Policy inputs can use
-    either the observation branch or the earlier ground-truth prototype, while world truth
-    remains internal for dynamics, rewards, interference, and evaluation logs.
+    `local_only` uses legal self state plus anonymous local target candidates for
+    actor/critic inputs. `groundtruth` is a debug mode that trains from full world-truth
+    target features.
     """
 
     def __init__(
@@ -89,7 +90,7 @@ class SwarmEnv:
         self.policy_input_mode = str(resolved_policy_input_mode).lower()
         if self.policy_input_mode not in POLICY_INPUT_MODES:
             raise ValueError(
-                "policy_input.mode must be either 'observation' or 'groundtruth', "
+                "policy_input.mode must be either 'local_only' or 'groundtruth', "
                 f"got {self.policy_input_mode!r}."
             )
 
@@ -139,6 +140,9 @@ class SwarmEnv:
         self.space_spec: SwarmSpaceSpec | None = None
         self._previous_assigned_targets: np.ndarray | None = None
         self._previous_assigned_distances: np.ndarray | None = None
+        self._last_observations: dict[str, np.ndarray] | None = None
+        self._last_observation_time_step: int | None = None
+        self._reset_count = 0
 
     def reset(
         self,
@@ -150,24 +154,28 @@ class SwarmEnv:
 
         if seed is not None:
             self.seed = seed
+            self._reset_count = 0
         if initial_positions is not None:
             self.initial_positions = initial_positions
 
+        episode_seed = self._next_episode_seed()
         self.scene = initialize_scene(
             key_num=self.key_num,
             nonkey_num=self.nonkey_num,
             mydrone_num=self.mydrone_num,
             bounds=self.bounds,
             dt=self.dt,
-            seed=self.seed,
+            seed=episode_seed,
             enemy_vmax=self.enemy_vmax,
             friendly_vmax=self.friendly_vmax,
             initial_positions=self.initial_positions,
         )
         self.world = SwarmWorld.from_scene(self.scene)
         self.world.reset()
-        self.global_key_target_sensor.reset(self.world.get_key_enemy_positions(), seed=self.seed)
-        self.local_target_sensor.reset(seed=self.seed)
+        self.global_key_target_sensor.reset(self.world.get_key_enemy_positions(), seed=episode_seed)
+        self.local_target_sensor.reset(seed=episode_seed)
+        self._last_observations = None
+        self._last_observation_time_step = None
         self._build_spaces()
         self._reset_tracking_memory()
 
@@ -181,6 +189,7 @@ class SwarmEnv:
                 "key_enemy_interference_dbm": self.world.interference.key_enemy_received_dbm.copy(),
                 "key_enemy_interference_watts": self.world.interference.key_enemy_received_watts.copy(),
                 "policy_input_mode": self.policy_input_mode,
+                "episode_seed": episode_seed,
             }
             for idx, agent_id in enumerate(self.agent_ids)
         }
@@ -297,6 +306,13 @@ class SwarmEnv:
         self._previous_assigned_targets = np.full(len(self.agent_ids), -1, dtype=int)
         self._previous_assigned_distances = np.full(len(self.agent_ids), np.nan, dtype=float)
 
+    def _next_episode_seed(self) -> int | None:
+        if self.seed is None:
+            return None
+        episode_seed = int(self.seed) + self._reset_count
+        self._reset_count += 1
+        return episode_seed
+
     @staticmethod
     def _empty_assignment_components(
         num_friendlies: int,
@@ -317,54 +333,52 @@ class SwarmEnv:
             "safety_penalty": np.zeros(num_friendlies, dtype=float),
         }
 
-    def _get_policy_key_target_positions(self) -> np.ndarray:
-        """Return key-target positions from the selected policy-input branch."""
+    def get_global_key_priors(self) -> np.ndarray:
+        """Return delayed/noisy key-target priors for the future association module."""
 
         if self.world is None:
-            raise RuntimeError("reset() must be called before reading key targets.")
-        if self.policy_input_mode == "groundtruth":
-            return self.world.get_key_enemy_positions()
-
+            raise RuntimeError("reset() must be called before reading global key priors.")
         return self.global_key_target_sensor.observe(
             time_step=self.world.time_step,
             dt=self.dt,
             fallback_key_positions=self.world.get_key_enemy_positions(),
         )
 
-    def _include_non_key_policy_inputs(self) -> bool:
-        return self.policy_input_mode == "groundtruth"
+    def get_association_outputs(self) -> dict[str, AssociationOutput]:
+        """Return placeholder association outputs without feeding them to actor/critic."""
 
-    def _get_policy_enemy_view(self) -> tuple[np.ndarray, np.ndarray]:
         if self.world is None:
-            raise RuntimeError("reset() must be called before reading enemy positions.")
-        return build_policy_enemy_view(
-            enemy_positions=self.world.get_enemy_positions(),
-            enemy_roles=[node.role for node in self.world.enemy_nodes],
-            key_target_positions=self._get_policy_key_target_positions(),
-            include_non_key=self._include_non_key_policy_inputs(),
-        )
+            raise RuntimeError("reset() must be called before reading association outputs.")
+        return {agent_id: empty_association_output() for agent_id in self.agent_ids}
 
     def get_global_state(self) -> np.ndarray:
-        """Return a flattened critic state using the selected policy-input enemy view."""
+        """Return the critic state for the configured policy-input mode."""
 
         if self.world is None:
             raise RuntimeError("reset() must be called before get_global_state().")
 
-        enemy_positions, _ = self._get_policy_enemy_view()
-        enemy_positions = enemy_positions.reshape(-1)
-        friendly_positions = self.world.get_friendly_positions().reshape(-1)
-        key_enemy_interference_dbm = self.world.interference.key_enemy_received_dbm.reshape(-1)
-        friendly_interference_dbm = self.world.interference.friendly_received_dbm.reshape(-1)
-        return np.concatenate(
-            [enemy_positions, friendly_positions, key_enemy_interference_dbm, friendly_interference_dbm],
-            dtype=np.float32,
-        )
+        if self.policy_input_mode == "groundtruth":
+            bounds = np.asarray(self.world.bounds, dtype=float)
+            enemy_positions = (self.world.get_key_enemy_positions() / bounds).reshape(-1)
+            friendly_positions = (self.world.get_friendly_positions() / bounds).reshape(-1)
+            key_enemy_interference_dbm = self.world.interference.key_enemy_received_dbm.reshape(-1)
+            friendly_interference_dbm = self.world.interference.friendly_received_dbm.reshape(-1)
+            return np.concatenate(
+                [enemy_positions, friendly_positions, key_enemy_interference_dbm, friendly_interference_dbm],
+                dtype=np.float32,
+            )
+
+        if self._last_observation_time_step != self.world.time_step or self._last_observations is None:
+            self._build_observations()
+        assert self._last_observations is not None
+        ordered_obs = [self._last_observations[agent_id] for agent_id in self.agent_ids]
+        return np.concatenate(ordered_obs, dtype=np.float32)
 
     def get_local_observations(self) -> dict[str, LocalTargetObservation]:
         """Return fixed-length local target observations for each friendly UAV.
 
-        These observations are sensing outputs only. They are not currently fed to actor
-        observations or critic state.
+        These anonymous local candidates are the only target observations currently fed
+        to actor observations and critic state.
         """
 
         if self.world is None:
@@ -385,27 +399,80 @@ class SwarmEnv:
             return
 
         action_dim = self.world.friendly_uavs[0].action_dim
-        num_enemies = len(self.world.enemy_nodes) if self._include_non_key_policy_inputs() else len(self.world.get_key_enemy_nodes())
+        num_enemies = len(self.world.enemy_nodes)
         num_friendlies = len(self.world.friendly_uavs)
         num_key_enemies = len(self.world.get_key_enemy_nodes())
-        self.space_spec = build_space_spec(num_friendlies, num_enemies, num_key_enemies, action_dim)
+        max_local_candidates = int(self.local_target_sensor.config.max_candidates)
+        self.space_spec = build_space_spec(
+            num_friendlies,
+            num_enemies,
+            num_key_enemies,
+            max_local_candidates,
+            action_dim,
+            self.policy_input_mode,
+        )
         self.action_spaces = build_action_spaces(num_friendlies, action_dim)
-        self.observation_spaces = build_observation_spaces(num_friendlies, num_enemies, num_key_enemies, self.world.bounds)
+        self.observation_spaces = build_observation_spaces(
+            num_friendlies,
+            num_enemies,
+            num_key_enemies,
+            max_local_candidates,
+            self.world.bounds,
+            self.policy_input_mode,
+        )
         self.global_state_space = build_global_state_space(
             num_friendlies,
             num_enemies,
             num_key_enemies,
+            max_local_candidates,
             self.world.bounds,
+            self.policy_input_mode,
         )
 
     def _build_observations(self) -> dict[str, np.ndarray]:
         if self.world is None:
             raise RuntimeError("reset() must be called before building observations.")
 
-        # Actor observations expose normalized relative geometry based on the selected
-        # policy-visible enemy view.
-        enemy_positions, enemy_is_key = self._get_policy_enemy_view()
-        key_enemy_positions = self._get_policy_key_target_positions()
+        if self.policy_input_mode == "groundtruth":
+            return self._build_groundtruth_observations()
+        return self._build_local_only_observations()
+
+    def _build_local_only_observations(self) -> dict[str, np.ndarray]:
+        if self.world is None:
+            raise RuntimeError("reset() must be called before building observations.")
+
+        local_observations = self.get_local_observations()
+        friendly_positions = self.world.get_friendly_positions()
+        bounds = np.asarray(self.world.bounds, dtype=float)
+        observations: dict[str, np.ndarray] = {}
+        for idx, agent_id in enumerate(self.agent_ids):
+            self_position = friendly_positions[idx]
+            self_position_normalized = self_position / bounds
+            local_observation = local_observations[agent_id]
+            local_relative = local_observation.relative_positions / bounds
+            observation = np.concatenate(
+                [
+                    self_position_normalized,
+                    local_relative.reshape(-1),
+                    local_observation.mask,
+                ]
+            ).astype(np.float32)
+            observations[agent_id] = observation
+        self._last_observations = {agent_id: obs.copy() for agent_id, obs in observations.items()}
+        self._last_observation_time_step = self.world.time_step
+        return observations
+
+    def _build_groundtruth_observations(self) -> dict[str, np.ndarray]:
+        if self.world is None:
+            raise RuntimeError("reset() must be called before building observations.")
+
+        enemy_positions, enemy_is_key = build_policy_enemy_view(
+            enemy_positions=self.world.get_enemy_positions(),
+            enemy_roles=[node.role for node in self.world.enemy_nodes],
+            key_target_positions=self.world.get_key_enemy_positions(),
+            include_non_key=False,
+        )
+        key_enemy_positions = self.world.get_key_enemy_positions()
         friendly_positions = self.world.get_friendly_positions()
         bounds = np.asarray(self.world.bounds, dtype=float)
         distance_norm = float(np.linalg.norm(bounds))
@@ -448,4 +515,6 @@ class SwarmEnv:
                 ]
             ).astype(np.float32)
             observations[agent_id] = observation
+        self._last_observations = {agent_id: obs.copy() for agent_id, obs in observations.items()}
+        self._last_observation_time_step = self.world.time_step
         return observations
